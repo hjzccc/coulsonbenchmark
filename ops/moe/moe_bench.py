@@ -14,19 +14,31 @@ def is_blackwell():
     return major >= 10
 
 HAS_FP4 = False
+HAS_FP8 = False
 
+# Try to import FP8 support (works on Hopper H100 and newer)
+try:
+    import sys
+    import transformer_engine.pytorch as te
+    # After importing te.pytorch, the .so is loaded into sys.modules
+    tex = sys.modules['transformer_engine_torch']
+    HAS_FP8 = te.is_fp8_available()
+    if HAS_FP8:
+        print(f"FP8 support: ENABLED")
+    else:
+        print(f"FP8 support: DISABLED (requires Hopper H100 SM90+ or newer)")
+except (ImportError, AttributeError, KeyError) as e:
+    print(f"FP8 support: DISABLED ({e})")
+
+# Try to import FP4 support (Blackwell only)
 if is_blackwell():
     try:
-        import torch
-        import transformer_engine.pytorch as te
-        import transformer_engine_torch as tex
-        from transformer_engine.common import recipe
         from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Quantizer, NVFP4Tensor
         from transformer_engine.pytorch.cpp_extensions import general_gemm
-        from transformer_engine.pytorch.module.base import get_workspace
+        # from transformer_engine.pytorch.module.base import get_workspace
         HAS_FP4 = True
         print("FP4 support: ENABLED (Blackwell GPU detected)")
-    except (ImportError, AttributeError) as e:
+    except (ImportError, AttributeError, KeyError) as e:
         print(f"FP4 support: DISABLED ({e})")
 else:
     cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
@@ -53,7 +65,11 @@ def benchmark_bf16_matmul(N, K):
         
         A = torch.randn(m_aligned, K, device=device, dtype=ACCUM_DTYPE).contiguous()
         B = torch.randn(K, N, device=device, dtype=ACCUM_DTYPE).contiguous()
-        
+        # Warm-up to initialize cuBLAS before graph capture
+        for _ in range(num_warmups):
+            C = torch.matmul(A, B)
+
+        torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         stream = torch.cuda.Stream()
         with torch.cuda.graph(graph,stream=stream):
@@ -120,7 +136,7 @@ def benchmark_fp4_general_gemm(N, K):
     )
     
     # Get workspace
-    workspace = get_workspace()
+    # workspace = get_workspace()
     
     for m in batch_sizes:
         m_aligned = align_to(m, 16)
@@ -138,7 +154,7 @@ def benchmark_fp4_general_gemm(N, K):
             out, *_ = general_gemm(
                 W_fp4,      # Weight [N, K]
                 A_fp4,      # Input [M, K]  
-                workspace,
+                # workspace,
                 out_dtype=ACCUM_DTYPE,
             )
             return out
@@ -201,7 +217,7 @@ def benchmark_fp4_pure_gemm(N, K):
         stochastic_rounding=False,
     )
     
-    workspace = get_workspace()
+    # workspace = get_workspace()
     
     for m in batch_sizes:
         m_aligned = align_to(m, 16)
@@ -216,7 +232,7 @@ def benchmark_fp4_pure_gemm(N, K):
             out, *_ = general_gemm(
                 W_fp4,
                 A_fp4,
-                workspace,
+                    # workspace,
                 out_dtype=ACCUM_DTYPE,
             )
             return out
@@ -245,6 +261,98 @@ def benchmark_fp4_pure_gemm(N, K):
     return results
 
 
+@torch.inference_mode()
+def benchmark_fp8_pure_gemm(N, K):
+    """
+    Pure FP8 GEMM using general_gemm - both inputs pre-quantized.
+    This measures only tensor core performance (upper bound).
+    """
+    if not HAS_FP8:
+        return [0.0] * len(batch_sizes)
+
+    try:
+        from transformer_engine.pytorch.tensor.float8_tensor import Float8Tensor, Float8Quantizer
+    except ImportError:
+        print("Warning: Could not import FP8 components from Transformer Engine")
+        return [0.0] * len(batch_sizes)
+
+    results = []
+
+    K_aligned = align_to(K, 16)
+    N_aligned = align_to(N, 16)
+
+    # Create quantizer for weights
+    W_scale = torch.ones(1, device=device, dtype=torch.float32)
+    W_amax = torch.ones(1, device=device, dtype=torch.float32)
+    weight_quantizer = Float8Quantizer(
+        scale=W_scale,
+        amax=W_amax,
+        fp8_dtype=tex.DType.kFloat8E4M3,
+        rowwise=True,
+        columnwise=True,
+    )
+
+    # Pre-quantize weights [N, K]
+    W_bf16 = torch.randn(N_aligned, K_aligned, device=device, dtype=ACCUM_DTYPE).contiguous()
+    W_fp8 = weight_quantizer.quantize_impl(W_bf16)
+
+    # Create quantizer for activations
+    A_scale = torch.ones(1, device=device, dtype=torch.float32)
+    A_amax = torch.ones(1, device=device, dtype=torch.float32)
+    act_quantizer = Float8Quantizer(
+        scale=A_scale,
+        amax=A_amax,
+        fp8_dtype=tex.DType.kFloat8E4M3,
+        rowwise=True,
+        columnwise=False,
+    )
+
+    for m in batch_sizes:
+        m_aligned = align_to(m, 16)
+
+        # Pre-quantize activation
+        A_bf16 = torch.randn(m_aligned, K_aligned, device=device, dtype=ACCUM_DTYPE).contiguous()
+        A_fp8 = act_quantizer.quantize_impl(A_bf16)
+
+        def run_gemm_only():
+            # Update usage flags
+            A_fp8.update_usage(rowwise_usage=True)
+            W_fp8.update_usage(columnwise_usage=True)
+            # FP8 GEMM via general_gemm
+            out, *_ = general_gemm(
+                W_fp8,      # Weight [N, K]
+                A_fp8,      # Input [M, K]
+                out_dtype=ACCUM_DTYPE,
+            )
+            return out
+
+        # Create CUDA graph
+        graph = torch.cuda.CUDAGraph()
+        stream = torch.cuda.Stream()
+        with torch.cuda.graph(graph, stream=stream):
+            for _ in range(num_graph_repeats):
+                run_gemm_only()
+
+        # Warm-up
+        for _ in range(num_warmups):
+            graph.replay()
+
+        torch.cuda.synchronize()
+        times = []
+        for _ in range(num_repeats):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            graph.replay()
+            end.record()
+            torch.cuda.synchronize()
+            times.append(start.elapsed_time(end))
+
+        results.append(np.mean(times))
+
+    return results
+
+
 # ============ Main Benchmark ============
 
 configs = [
@@ -253,7 +361,7 @@ configs = [
 ]
 
 print("\n" + "="*60)
-print("Pure GEMM Benchmark: BF16 vs FP4 (using general_gemm)")
+print("Pure GEMM Benchmark: BF16 vs FP8 vs FP4")
 print("="*60)
 
 all_results = {}
@@ -262,42 +370,55 @@ for config in configs:
     K = config["K"]
     N = config["N"]
     name = config["name"]
-    
+
     print(f"\n{name} config: K={K}, N={N}")
     print("-" * 40)
-    
+
     print("  Running BF16 matmul...")
     bf16_times = benchmark_bf16_matmul(N, K)
-    
+
+    if HAS_FP8:
+        print("  Running FP8 GEMM (pure)...")
+        fp8_pure_times = benchmark_fp8_pure_gemm(N, K)
+        fp8_with_quant_times = [0.0] * len(batch_sizes)  # Not implemented yet
+    else:
+        fp8_with_quant_times = [0.0] * len(batch_sizes)
+        fp8_pure_times = [0.0] * len(batch_sizes)
+
     if HAS_FP4:
         print("  Running FP4 GEMM (with activation quantization)...")
-        # fp4_with_quant_times = benchmark_fp4_general_gemm(N, K)
-        fp4_with_quant_times = [0.0] * len(batch_sizes)
-        
+        fp4_with_quant_times = benchmark_fp4_general_gemm(N, K)
+        # fp4_with_quant_times = [0.0] * len(batch_sizes)
+
         print("  Running FP4 GEMM (pure, no activation quantization)...")
         fp4_pure_times = benchmark_fp4_pure_gemm(N, K)
     else:
         fp4_with_quant_times = [0.0] * len(batch_sizes)
         fp4_pure_times = [0.0] * len(batch_sizes)
-    
+
     all_results[name] = {
         'bf16': bf16_times,
+        'fp8_quant': fp8_with_quant_times,
+        'fp8_pure': fp8_pure_times,
         'fp4_quant': fp4_with_quant_times,
         'fp4_pure': fp4_pure_times,
     }
     
-    print(f"\n  {'Batch':<8} {'BF16 (ms)':<12} {'FP4+quant (ms)':<15} {'FP4 pure (ms)':<15} {'Speedup':<10}")
-    print("  " + "-" * 60)
-    
+    print(f"\n  {'Batch':<8} {'BF16 (ms)':<12} {'FP8+quant (ms)':<15} {'FP8 pure (ms)':<15} {'FP4+quant (ms)':<15} {'FP4 pure (ms)':<15} {'FP8 Speedup':<13} {'FP4 Speedup':<13}")
+    print("  " + "-" * 120)
+
     for i, m in enumerate(batch_sizes):
         m_aligned = align_to(m, 16)
         bf16_t = bf16_times[i]
+        fp8_q_t = fp8_with_quant_times[i]
+        fp8_p_t = fp8_pure_times[i]
         fp4_q_t = fp4_with_quant_times[i]
         fp4_p_t = fp4_pure_times[i]
-        
-        speedup = bf16_t / fp4_p_t if fp4_p_t > 0 else 0
-        
-        print(f"  {m_aligned:<8} {bf16_t:<12.3f} {fp4_q_t:<15.3f} {fp4_p_t:<15.3f} {speedup:<10.2f}x")
+
+        fp8_speedup = bf16_t / fp8_p_t if fp8_p_t > 0 else 0
+        fp4_speedup = bf16_t / fp4_p_t if fp4_p_t > 0 else 0
+
+        print(f"  {m_aligned:<8} {bf16_t:<12.3f} {fp8_q_t:<15.3f} {fp8_p_t:<15.3f} {fp4_q_t:<15.3f} {fp4_p_t:<15.3f} {fp8_speedup:<13.2f}x {fp4_speedup:<13.2f}x")
 
 # ============ Plotting ============
 
@@ -308,16 +429,26 @@ if len(configs) == 1:
 for idx, config in enumerate(configs):
     name = config["name"]
     results = all_results[name]
-    
+
     ax = axes[idx]
     x = np.arange(len(batch_sizes))
-    width = 0.25
-    
-    ax.bar(x - width, results['bf16'], width, label='BF16', color='blue', alpha=0.7)
+    width = 0.2
+
+    bar_idx = 0
+    ax.bar(x + bar_idx * width - width, results['bf16'], width, label='BF16', color='blue', alpha=0.7)
+    bar_idx += 1
+
+    if HAS_FP8:
+        ax.bar(x + bar_idx * width - width, results['fp8_quant'], width, label='FP8 (+ act quant)', color='purple', alpha=0.7)
+        bar_idx += 1
+        ax.bar(x + bar_idx * width - width, results['fp8_pure'], width, label='FP8 (pure GEMM)', color='darkviolet', alpha=0.7)
+        bar_idx += 1
+
     if HAS_FP4:
-        ax.bar(x, results['fp4_quant'], width, label='FP4 (+ act quant)', color='orange', alpha=0.7)
-        ax.bar(x + width, results['fp4_pure'], width, label='FP4 (pure GEMM)', color='green', alpha=0.7)
-    
+        ax.bar(x + bar_idx * width - width, results['fp4_quant'], width, label='FP4 (+ act quant)', color='orange', alpha=0.7)
+        bar_idx += 1
+        ax.bar(x + bar_idx * width - width, results['fp4_pure'], width, label='FP4 (pure GEMM)', color='green', alpha=0.7)
+
     ax.set_xlabel('Batch Size (M)')
     ax.set_ylabel('Time (ms)')
     ax.set_title(f'{name}: K={config["K"]}, N={config["N"]}')
@@ -341,16 +472,17 @@ for config in configs:
     N = config["N"]
     name = config["name"]
     results = all_results[name]
-    
+
     print(f"\n{name} config:")
-    print(f"  {'Batch':<8} {'BF16 TFLOPS':<15} {'FP4 TFLOPS':<15}")
-    print("  " + "-" * 40)
-    
+    print(f"  {'Batch':<8} {'BF16 TFLOPS':<15} {'FP8 TFLOPS':<15} {'FP4 TFLOPS':<15}")
+    print("  " + "-" * 55)
+
     for i, m in enumerate(batch_sizes):
         m_aligned = align_to(m, 16)
         flops = 2.0 * m_aligned * N * K
-        
+
         bf16_tflops = (flops * num_graph_repeats) / (results['bf16'][i] * 1e-3) / 1e12
+        fp8_tflops = (flops * num_graph_repeats) / (results['fp8_pure'][i] * 1e-3) / 1e12 if results['fp8_pure'][i] > 0 else 0
         fp4_tflops = (flops * num_graph_repeats) / (results['fp4_pure'][i] * 1e-3) / 1e12 if results['fp4_pure'][i] > 0 else 0
-        
-        print(f"  {m_aligned:<8} {bf16_tflops:<15.2f} {fp4_tflops:<15.2f}")
+
+        print(f"  {m_aligned:<8} {bf16_tflops:<15.2f} {fp8_tflops:<15.2f} {fp4_tflops:<15.2f}")
